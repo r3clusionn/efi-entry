@@ -1,0 +1,147 @@
+#!/usr/bin/python3 -I
+"""efi-entry: UEFI boot entries from Linux without efibootmgr (efivarfs only). Run as root:
+  efi-entry show                          BootCurrent, BootNext, BootOrder and every Boot#### entry
+  efi-entry add NUM LABEL PATH [OPTIONS]  new BootNUM: a copy of the entry you booted (same disk,
+                                          partition and load options) that boots PATH instead, with
+                                          OPTIONS appended to the load options
+  efi-entry next NUM                      boot NUM once (BootNext)
+  efi-entry opts NUM [OPTIONS]            set BootNUM's load options (none given: remove them)
+  efi-entry del NUM                       delete BootNUM, and BootNext if it points there
+NUM is hexadecimal (0002, F0). EFI_TEMPLATE=NUM copies that entry instead of BootCurrent."""
+import fcntl, os, re, struct, sys
+
+G = '8be4df61-93ca-11d2-aa0d-00e098032b8c'
+EV = '/sys/firmware/efi/efivars/'
+
+
+def var(n):
+    return f'{EV}{n}-{G}'
+
+
+def boot(num):
+    return f'Boot{num:04X}'
+
+
+def read(n):
+    with open(var(n), 'rb') as f:
+        return f.read()[4:]
+
+
+def mutable(p):
+    fd = os.open(p, os.O_RDONLY)  # efivarfs files are immutable until the flag is cleared
+    fl = struct.unpack('i', fcntl.ioctl(fd, 0x80086601, b'\0' * 4))[0]
+    fcntl.ioctl(fd, 0x40086602, struct.pack('i', fl & ~0x10))
+    os.close(fd)
+
+
+def write(n, data):
+    p = var(n)
+    if os.path.exists(p):
+        mutable(p)
+    with open(p, 'wb', buffering=0) as f:
+        f.write(b'\x07\0\0\0' + data)  # non-volatile, boot + runtime access
+    assert read(n) == data, n + ': read-back mismatch'
+
+
+def unlink(n):
+    p = var(n)
+    if os.path.exists(p):
+        mutable(p)
+        os.unlink(p)
+
+
+def parse(d):
+    """EFI_LOAD_OPTION -> attributes, description, device path, optional data"""
+    fpl = int.from_bytes(d[4:6], 'little')
+    i = 6
+    while d[i:i + 2] != b'\0\0':
+        i += 2
+    return d[:4], d[6:i].decode('utf-16-le'), d[i + 2:i + 2 + fpl], d[i + 2 + fpl:]
+
+
+def pack(attr, desc, fp, opt):
+    return attr + len(fp).to_bytes(2, 'little') + (desc + '\0').encode('utf-16-le') + fp + opt
+
+
+def nodes(fp):
+    i = 0
+    while i < len(fp):
+        n = int.from_bytes(fp[i + 2:i + 4], 'little')
+        yield fp[i], fp[i + 1], fp[i:i + n]
+        i += n
+
+
+def filepath(fp):
+    for t, s, n in nodes(fp):
+        if (t, s) == (4, 4):
+            return n[4:].decode('utf-16-le').rstrip('\0')
+
+
+def text(opt):
+    """the load options as a string if they are one (a kernel command line), else None"""
+    if len(opt) % 2:
+        return None
+    try:
+        s = opt.decode('utf-16-le').rstrip('\0')
+    except UnicodeDecodeError:
+        return None
+    return s if s.isprintable() else None
+
+
+def ucs2(s):
+    return (s + '\0').encode('utf-16-le') if s else b''
+
+
+def num(i):
+    return int(sys.argv[i], 16)
+
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else 'show'
+if cmd == 'add' and len(sys.argv) in (5, 6):
+    name, label, path = boot(num(2)), sys.argv[3], sys.argv[4]
+    extra = sys.argv[5] if len(sys.argv) > 5 else ''
+    assert not os.path.exists(var(name)), name + ' already exists'
+    tmpl = os.environ.get('EFI_TEMPLATE') or f'{int.from_bytes(read("BootCurrent"), "little"):04X}'
+    attr, desc, fp, opt = parse(read('Boot' + tmpl.upper().zfill(4)))
+    assert filepath(fp), f'Boot{tmpl} ({desc}) has no file path to replace'
+    new = b''
+    for t, s, n in nodes(fp):
+        if (t, s) == (4, 4):  # media file path node
+            pn = (path + '\0').encode('utf-16-le')
+            n = b'\x04\x04' + (4 + len(pn)).to_bytes(2, 'little') + pn
+        new += n
+    assert filepath(new) == path and new.endswith(b'\x7f\xff\x04\x00'), 'unexpected device path'
+    if extra:
+        old = text(opt)
+        assert old is not None, f'Boot{tmpl} ({desc}) has binary load options; nothing to append to'
+        opt = ucs2((old + ' ' if old else '') + extra)
+    write(name, pack(attr, label, new, opt))
+elif cmd == 'next' and len(sys.argv) == 3:
+    assert os.path.exists(var(boot(num(2)))), 'no ' + boot(num(2))
+    write('BootNext', num(2).to_bytes(2, 'little'))
+elif cmd == 'opts' and len(sys.argv) in (3, 4):
+    name = boot(num(2))
+    attr, desc, fp, opt = parse(read(name))
+    new = ucs2(sys.argv[3] if len(sys.argv) > 3 else '')
+    print(f'{name} {desc}: was {text(opt) if text(opt) is not None else opt.hex()!r}')
+    if new != opt:
+        write(name, pack(attr, desc, fp, new))
+    print(f'{name} {desc}: now {text(new)!r}')
+elif cmd == 'del' and len(sys.argv) == 3:
+    if os.path.exists(var('BootNext')) and int.from_bytes(read('BootNext'), 'little') == num(2):
+        unlink('BootNext')
+    unlink(boot(num(2)))
+elif cmd == 'show' and len(sys.argv) <= 2:
+    for n in ('BootCurrent', 'BootNext'):
+        if os.path.exists(var(n)):
+            print(f'{n}: {int.from_bytes(read(n), "little"):04X}')
+    o = read('BootOrder')
+    print('BootOrder: ' + ','.join(f'{int.from_bytes(o[i:i + 2], "little"):04X}' for i in range(0, len(o), 2)))
+    for f in sorted(os.listdir(EV)):
+        m = re.fullmatch(r'Boot([0-9A-F]{4})-' + G, f)
+        if m:
+            _, desc, fp, opt = parse(read('Boot' + m.group(1)))
+            extra = (text(opt) or '') if filepath(fp) else ''
+            print(f'Boot{m.group(1)} {desc}  {filepath(fp) or ""}  {extra}'.rstrip())
+else:
+    sys.exit(__doc__)
